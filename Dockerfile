@@ -97,35 +97,12 @@ RUN echo "=== Downloading LatentSync v1.0 models ===" && \
     huggingface-cli download ByteDance/LatentSync --local-dir checkpoints && \
     echo "✅ LatentSync v1.0 models downloaded"
 
-# Download enhancement models
-RUN echo "=== Downloading enhancement models ===" && \
-    mkdir -p /app/enhancers/GFPGAN && \
-    wget --no-check-certificate --timeout=60 --tries=3 \
-    "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/GFPGANv1.4.onnx" \
-    -O /app/enhancers/GFPGAN/GFPGANv1.4.onnx && \
-    echo "✅ GFPGAN model downloaded"
-
-# Download face detection models
-RUN echo "=== Downloading face detection models ===" && \
-    mkdir -p /app/utils && \
-    wget --no-check-certificate --timeout=60 --tries=3 \
-    "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/scrfd_2.5g_bnkps.onnx" \
-    -O /app/utils/scrfd_2.5g_bnkps.onnx && \
-    mkdir -p /app/faceID && \
-    wget --no-check-certificate --timeout=60 --tries=3 \
-    "http://108.181.198.160:9000/aiclipdfl/recognition.onnx" \
-    -O /app/faceID/recognition.onnx && \
-    echo "✅ Face detection models downloaded"
-
 # Verify all model files exist
 RUN echo "=== Verifying model files ===" && \
     test -f /app/configs/unet/second_stage.yaml && echo "✅ LatentSync v1.0 config verified" && \
     test -f /app/checkpoints/latentsync_unet.pt && echo "✅ LatentSync v1.0 UNet model verified" && \
     (test -f /app/checkpoints/whisper/tiny.pt && echo "✅ Whisper tiny model verified" || echo "ℹ️ Whisper tiny model not found") && \
-    (test -f /app/checkpoints/whisper/small.pt && echo "✅ Whisper small model verified" || echo "ℹ️ Whisper small model not found") && \
-    test -f /app/enhancers/GFPGAN/GFPGANv1.4.onnx && echo "✅ GFPGAN model verified" && \
-    test -f /app/utils/scrfd_2.5g_bnkps.onnx && echo "✅ RetinaFace model verified" && \
-    test -f /app/faceID/recognition.onnx && echo "✅ FaceRecognition model verified"
+    (test -f /app/checkpoints/whisper/small.pt && echo "✅ Whisper small model verified" || echo "ℹ️ Whisper small model not found")
 
 # Set environment variables
 ENV PYTHONPATH="/app"
