@@ -10,6 +10,7 @@ ENV CUDA_MODULE_LOADING=LAZY
 ENV PYTHONPATH="/app"
 ENV TORCH_HOME="/app/checkpoints"
 ENV HF_HOME="/app/checkpoints"
+ENV MPLBACKEND=Agg
 
 # Install system dependencies in single layer (chỉ cần FFmpeg cho core functionality)
 RUN apt-get update && apt-get install -y \
@@ -20,6 +21,9 @@ RUN apt-get update && apt-get install -y \
     wget \
     curl \
     git \
+    python3-tk \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 

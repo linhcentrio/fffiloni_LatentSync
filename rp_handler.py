@@ -23,6 +23,10 @@ import logging
 import gc
 from datetime import datetime
 
+# Configure matplotlib to use non-GUI backend before any imports that might use it
+import matplotlib
+matplotlib.use('Agg')
+
 # Add path for local modules
 sys.path.append('/app')
 
