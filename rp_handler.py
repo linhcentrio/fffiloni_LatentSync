@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RunPod Serverless Handler for LatentSync v1.0
-Optimized version - Core functionality only
+Optimized version - Core functionality only (ffmpeg-based, no moviepy)
 """
 
 import runpod
@@ -13,6 +13,8 @@ import time
 import torch
 import sys
 import shutil
+import subprocess
+import json
 from pathlib import Path
 from minio import Minio
 from urllib.parse import quote
@@ -20,8 +22,6 @@ from omegaconf import OmegaConf
 import logging
 import gc
 from datetime import datetime
-from moviepy.editor import VideoFileClip, concatenate_videoclips
-from pydub import AudioSegment
 
 # Add path for local modules
 sys.path.append('/app')
@@ -68,6 +68,207 @@ minio_client = Minio(
 # Global model instances
 config = None
 pipeline = None
+
+def get_media_info(file_path: str) -> dict:
+    """Get media file information using ffprobe (replaces moviepy/pydub)"""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-show_streams', file_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            logger.error(f"ffprobe failed: {result.stderr}")
+            return {}
+            
+        info = json.loads(result.stdout)
+        return info
+        
+    except Exception as e:
+        logger.error(f"Failed to get media info: {e}")
+        return {}
+
+def get_duration(file_path: str) -> float:
+    """Get media duration using ffprobe (replaces get_video_duration/get_audio_duration)"""
+    try:
+        info = get_media_info(file_path)
+        duration = float(info.get('format', {}).get('duration', 0))
+        return duration
+    except Exception as e:
+        logger.error(f"Failed to get duration: {e}")
+        return 0.0
+
+def crop_video_ffmpeg(video_path: str, temp_dir: str, max_duration: int = 10) -> str:
+    """Crop video using ffmpeg (replaces moviepy crop)"""
+    try:
+        input_file_name = os.path.basename(video_path)
+        output_path = os.path.join(temp_dir, f"cropped_{input_file_name}")
+        
+        duration = get_duration(video_path)
+        
+        if duration > max_duration:
+            cmd = [
+                'ffmpeg', '-y', '-i', video_path,
+                '-t', str(max_duration),
+                '-c:v', 'libx264', '-c:a', 'aac',
+                output_path
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            
+            if result.returncode == 0:
+                logger.info(f"✂️ Video cropped: {duration:.1f}s → {max_duration}s")
+                return output_path
+            else:
+                logger.error(f"ffmpeg crop failed: {result.stderr}")
+                return video_path
+        else:
+            # If already shorter, just copy
+            shutil.copy2(video_path, output_path)
+            return output_path
+            
+    except Exception as e:
+        logger.error(f"Failed to crop video: {e}")
+        return video_path
+
+def create_reverse_video_ffmpeg(video_path: str, temp_dir: str) -> str:
+    """Create reverse video using ffmpeg (replaces moviepy reverse)"""
+    try:
+        input_file_name = os.path.basename(video_path)
+        output_path = os.path.join(temp_dir, f"reverse_{input_file_name}")
+        
+        cmd = [
+            'ffmpeg', '-y', '-i', video_path,
+            '-vf', 'reverse',
+            '-af', 'areverse',
+            '-c:v', 'libx264', '-c:a', 'aac',
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            return output_path
+        else:
+            logger.error(f"ffmpeg reverse failed: {result.stderr}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Failed to create reverse video: {e}")
+        return None
+
+def create_pingpong_loop_ffmpeg(video_path: str, temp_dir: str, target_duration: float) -> str:
+    """Create pingpong loop using ffmpeg (replaces moviepy concatenation)"""
+    try:
+        video_duration = get_duration(video_path)
+        
+        if video_duration <= 0:
+            logger.error("Invalid video duration")
+            return video_path
+        
+        # Create reverse video
+        reverse_path = create_reverse_video_ffmpeg(video_path, temp_dir)
+        if not reverse_path:
+            logger.warning("Failed to create reverse video, using original")
+            return video_path
+        
+        # Calculate how many loops we need
+        cycle_duration = video_duration * 2  # forward + reverse
+        num_full_cycles = int(target_duration // cycle_duration)
+        remaining_time = target_duration % cycle_duration
+        
+        # Create concat file list
+        concat_file = os.path.join(temp_dir, "concat_list.txt")
+        input_file_name = os.path.basename(video_path)
+        output_path = os.path.join(temp_dir, f"pingpong_{input_file_name}")
+        
+        with open(concat_file, 'w') as f:
+            # Add full cycles
+            for _ in range(num_full_cycles):
+                f.write(f"file '{video_path}'\n")
+                f.write(f"file '{reverse_path}'\n")
+            
+            # Add remaining partial cycle
+            if remaining_time > 0:
+                if remaining_time <= video_duration:
+                    # Only partial forward
+                    f.write(f"file '{video_path}'\n")
+                else:
+                    # Full forward + partial reverse
+                    f.write(f"file '{video_path}'\n")
+                    f.write(f"file '{reverse_path}'\n")
+        
+        # Create the final concatenated video
+        cmd = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
+            '-i', concat_file,
+            '-t', str(target_duration),
+            '-c:v', 'libx264', '-c:a', 'aac',
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        
+        if result.returncode == 0:
+            logger.info(f"🔄 Pingpong loop created: {video_duration:.1f}s → {target_duration:.1f}s")
+            
+            # Cleanup
+            if os.path.exists(reverse_path):
+                os.remove(reverse_path)
+            if os.path.exists(concat_file):
+                os.remove(concat_file)
+                
+            return output_path
+        else:
+            logger.error(f"ffmpeg concat failed: {result.stderr}")
+            return video_path
+            
+    except Exception as e:
+        logger.error(f"Failed to create pingpong loop: {e}")
+        return video_path
+
+def simplified_process_inputs_ffmpeg(video_path: str, audio_path: str, crop_inputs: bool = False, pingpong: bool = True):
+    """
+    Simplified processing using ffmpeg instead of moviepy:
+    - crop_inputs: Whether to crop video to 10s max
+    - pingpong: Whether to apply pingpong loop when audio > video
+    """
+    processed_video_path = video_path
+    processed_audio_path = audio_path
+    temp_dir = tempfile.mkdtemp()
+    
+    # Step 1: Crop logic (independent)
+    if crop_inputs:
+        video_duration = get_duration(video_path)
+        if video_duration > 10.0:
+            processed_video_path = crop_video_ffmpeg(video_path, temp_dir, max_duration=10)
+            logger.info(f"✂️ Video cropped: {video_duration:.1f}s → 10.0s")
+        else:
+            logger.info(f"✅ Video already ≤ 10s: {video_duration:.1f}s")
+    else:
+        video_duration = get_duration(video_path)
+        logger.info(f"🎬 Keeping original video duration: {video_duration:.1f}s")
+    
+    # Step 2: Pingpong logic (independent)
+    if pingpong:
+        final_video_duration = get_duration(processed_video_path)
+        audio_duration = get_duration(audio_path)
+        
+        logger.info(f"📊 Duration check: Video={final_video_duration:.1f}s, Audio={audio_duration:.1f}s")
+        
+        if audio_duration > final_video_duration:
+            processed_video_path = create_pingpong_loop_ffmpeg(
+                processed_video_path, temp_dir, 
+                target_duration=audio_duration
+            )
+            logger.info(f"🔄 Pingpong loop applied: {final_video_duration:.1f}s → {audio_duration:.1f}s")
+        else:
+            logger.info(f"✅ No loop needed: Video({final_video_duration:.1f}s) ≥ Audio({audio_duration:.1f}s)")
+    else:
+        logger.info("🎯 Using LatentSync native duration handling")
+    
+    return processed_video_path, processed_audio_path
 
 def initialize_models():
     """Initialize LatentSync v1.0 pipeline"""
@@ -173,124 +374,6 @@ def upload_to_minio(local_path: str, object_name: str) -> str:
         logger.error(f"❌ Upload failed: {e}")
         raise e
 
-def get_audio_duration(file_path: str) -> float:
-    """Get audio duration in seconds"""
-    try:
-        audio = AudioSegment.from_file(file_path)
-        return len(audio) / 1000.0  # Convert from milliseconds to seconds
-    except Exception as e:
-        logger.error(f"❌ Failed to get audio duration: {e}")
-        return 0.0
-
-def get_video_duration(file_path: str) -> float:
-    """Get video duration in seconds"""
-    try:
-        video = VideoFileClip(file_path)
-        duration = video.duration
-        video.close()
-        return duration
-    except Exception as e:
-        logger.error(f"❌ Failed to get video duration: {e}")
-        return 0.0
-
-def crop_video_to_max(video_path: str, temp_dir: str, max_duration: int = 10) -> str:
-    """Simple video cropping to max duration"""
-    video = VideoFileClip(video_path)
-    input_file_name = os.path.basename(video_path)
-    output_path = os.path.join(temp_dir, f"cropped_{input_file_name}")
-    
-    if video.duration > max_duration:
-        cropped_video = video.subclip(0, max_duration)
-        cropped_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
-        cropped_video.close()
-    else:
-        # If already shorter, just copy
-        shutil.copy2(video_path, output_path)
-    
-    video.close()
-    return output_path
-
-def create_pingpong_loop(video_path: str, temp_dir: str, target_duration: float) -> str:
-    """Create pingpong loop: forward + reverse pattern"""
-    video = VideoFileClip(video_path)
-    clips = []
-    current_duration = 0
-    
-    # Create reverse clip
-    reverse_clip = video.fx(lambda clip: clip.resize(lambda t: clip.duration - t))
-    
-    input_file_name = os.path.basename(video_path)
-    output_path = os.path.join(temp_dir, f"pingpong_{input_file_name}")
-    
-    while current_duration < target_duration:
-        remaining = target_duration - current_duration
-        cycle_duration = video.duration * 2  # Forward + reverse
-        
-        if remaining >= cycle_duration:
-            # Add full cycle (forward + reverse)
-            clips.extend([video, reverse_clip])
-            current_duration += cycle_duration
-        elif remaining >= video.duration:
-            # Add forward + partial reverse
-            clips.append(video)
-            partial_reverse_duration = remaining - video.duration
-            clips.append(reverse_clip.subclip(0, partial_reverse_duration))
-            current_duration += remaining
-        else:
-            # Add partial forward
-            clips.append(video.subclip(0, remaining))
-            current_duration += remaining
-    
-    looped_video = concatenate_videoclips(clips)
-    looped_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
-    
-    video.close()
-    looped_video.close()
-    
-    return output_path
-
-def simplified_process_inputs(video_path: str, audio_path: str, crop_inputs: bool = False, pingpong: bool = True):
-    """
-    Simplified processing with two independent flags:
-    - crop_inputs: Whether to crop video to 10s max
-    - pingpong: Whether to apply pingpong loop when audio > video
-    """
-    processed_video_path = video_path
-    processed_audio_path = audio_path
-    temp_dir = tempfile.mkdtemp()
-    
-    # Step 1: Crop logic (independent)
-    if crop_inputs:
-        video_duration = get_video_duration(video_path)
-        if video_duration > 10.0:
-            processed_video_path = crop_video_to_max(video_path, temp_dir, max_duration=10)
-            logger.info(f"✂️ Video cropped: {video_duration:.1f}s → 10.0s")
-        else:
-            logger.info(f"✅ Video already ≤ 10s: {video_duration:.1f}s")
-    else:
-        video_duration = get_video_duration(video_path)
-        logger.info(f"🎬 Keeping original video duration: {video_duration:.1f}s")
-    
-    # Step 2: Pingpong logic (independent)
-    if pingpong:
-        final_video_duration = get_video_duration(processed_video_path)
-        audio_duration = get_audio_duration(audio_path)
-        
-        logger.info(f"📊 Duration check: Video={final_video_duration:.1f}s, Audio={audio_duration:.1f}s")
-        
-        if audio_duration > final_video_duration:
-            processed_video_path = create_pingpong_loop(
-                processed_video_path, temp_dir, 
-                target_duration=audio_duration
-            )
-            logger.info(f"🔄 Pingpong loop applied: {final_video_duration:.1f}s → {audio_duration:.1f}s")
-        else:
-            logger.info(f"✅ No loop needed: Video({final_video_duration:.1f}s) ≥ Audio({audio_duration:.1f}s)")
-    else:
-        logger.info("🎯 Using LatentSync native duration handling")
-    
-    return processed_video_path, processed_audio_path
-
 def run_lipsync_inference(video_path: str, audio_path: str, output_path: str,
                          inference_steps: int, guidance_scale: float, 
                          seed: int, crop_inputs: bool = False, pingpong: bool = True) -> bool:
@@ -307,7 +390,7 @@ def run_lipsync_inference(video_path: str, audio_path: str, output_path: str,
         # Process inputs using simplified logic
         if crop_inputs or pingpong:
             temp_dir = tempfile.mkdtemp()
-            processed_video_path, processed_audio_path = simplified_process_inputs(
+            processed_video_path, processed_audio_path = simplified_process_inputs_ffmpeg(
                 video_path, audio_path, crop_inputs, pingpong
             )
         else:
